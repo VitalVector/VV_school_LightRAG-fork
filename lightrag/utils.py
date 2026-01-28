@@ -1,12 +1,10 @@
 from __future__ import annotations
 import weakref
 
-import sys
-
 import asyncio
 import html
 import csv
-import inspect
+import contextvars
 import json
 import logging
 import logging.handlers
@@ -18,17 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
 from hashlib import md5
-from typing import (
-    Any,
-    Protocol,
-    Callable,
-    TYPE_CHECKING,
-    List,
-    Optional,
-    Iterable,
-    Sequence,
-    Collection,
-)
+from typing import Any, Protocol, Callable, TYPE_CHECKING, List, Optional
 import numpy as np
 from dotenv import load_dotenv
 
@@ -38,39 +26,8 @@ from lightrag.constants import (
     DEFAULT_LOG_FILENAME,
     GRAPH_FIELD_SEP,
     DEFAULT_MAX_TOTAL_TOKENS,
-    DEFAULT_SOURCE_IDS_LIMIT_METHOD,
-    VALID_SOURCE_IDS_LIMIT_METHODS,
-    SOURCE_IDS_LIMIT_METHOD_FIFO,
+    DEFAULT_MAX_FILE_PATH_LENGTH,
 )
-
-# Precompile regex pattern for JSON sanitization (module-level, compiled once)
-_SURROGATE_PATTERN = re.compile(r"[\uD800-\uDFFF\uFFFE\uFFFF]")
-
-
-class SafeStreamHandler(logging.StreamHandler):
-    """StreamHandler that gracefully handles closed streams during shutdown.
-
-    This handler prevents "ValueError: I/O operation on closed file" errors
-    that can occur when pytest or other test frameworks close stdout/stderr
-    before Python's logging cleanup runs.
-    """
-
-    def flush(self):
-        """Flush the stream, ignoring errors if the stream is closed."""
-        try:
-            super().flush()
-        except (ValueError, OSError):
-            # Stream is closed or otherwise unavailable, silently ignore
-            pass
-
-    def close(self):
-        """Close the handler, ignoring errors if the stream is already closed."""
-        try:
-            super().close()
-        except (ValueError, OSError):
-            # Stream is closed or otherwise unavailable, silently ignore
-            pass
-
 
 # Initialize logger with basic configuration
 logger = logging.getLogger("lightrag")
@@ -79,7 +36,7 @@ logger.setLevel(logging.INFO)
 
 # Add console handler if no handlers exist
 if not logger.handlers:
-    console_handler = SafeStreamHandler()
+    console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     formatter = logging.Formatter("%(levelname)s: %(message)s")
     console_handler.setFormatter(formatter)
@@ -87,33 +44,6 @@ if not logger.handlers:
 
 # Set httpx logging level to WARNING
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
-
-def _patch_ascii_colors_console_handler() -> None:
-    """Prevent ascii_colors from printing flush errors during interpreter exit."""
-
-    try:
-        from ascii_colors import ConsoleHandler
-    except ImportError:
-        return
-
-    if getattr(ConsoleHandler, "_lightrag_patched", False):
-        return
-
-    original_handle_error = ConsoleHandler.handle_error
-
-    def _safe_handle_error(self, message: str) -> None:  # type: ignore[override]
-        exc_type, _, _ = sys.exc_info()
-        if exc_type in (ValueError, OSError) and "close" in message.lower():
-            return
-        original_handle_error(self, message)
-
-    ConsoleHandler.handle_error = _safe_handle_error  # type: ignore[assignment]
-    ConsoleHandler._lightrag_patched = True  # type: ignore[attr-defined]
-
-
-_patch_ascii_colors_console_handler()
-
 
 # Global import for pypinyin with startup-time logging
 try:
@@ -342,8 +272,8 @@ def setup_logger(
     logger_instance.handlers = []  # Clear existing handlers
     logger_instance.propagate = False
 
-    # Add console handler with safe stream handling
-    console_handler = SafeStreamHandler()
+    # Add console handler
+    console_handler = logging.StreamHandler()
     console_handler.setFormatter(simple_formatter)
     console_handler.setLevel(level)
     logger_instance.addHandler(console_handler)
@@ -409,122 +339,12 @@ class TaskState:
 
 @dataclass
 class EmbeddingFunc:
-    """Embedding function wrapper with dimension validation
-
-    This class wraps an embedding function to ensure that the output embeddings have the correct dimension.
-    If wrapped multiple times, the inner wrappers will be automatically unwrapped to prevent
-    configuration conflicts where inner wrapper settings would override outer wrapper settings.
-
-    Using functools.partial for parameter binding:
-        A common pattern is to use functools.partial to pre-bind model and host parameters
-        to an embedding function. When the base embedding function is already decorated with
-        @wrap_embedding_func_with_attrs (e.g., ollama_embed), use `.func` to access the
-        original unwrapped function to avoid double wrapping:
-
-        Example:
-            from functools import partial
-
-            # ❌ Wrong - causes double wrapping (inner EmbeddingFunc still executes)
-            func=partial(ollama_embed, embed_model="bge-m3:latest", host="http://localhost:11434")
-
-            # ✅ Correct - access the unwrapped function via .func
-            func=partial(ollama_embed.func, embed_model="bge-m3:latest", host="http://localhost:11434")
-
-    Args:
-        embedding_dim: Expected dimension of the embeddings(For dimension checking and workspace data isolation in vector DB)
-        func: The actual embedding function to wrap
-        max_token_size: Enable embedding token limit checking for description summarization(Set embedding_token_limit in LightRAG)
-        send_dimensions: Whether to inject embedding_dim argument to underlying function
-        model_name: Model name for implementing workspace data isolation in vector DB
-    """
-
     embedding_dim: int
     func: callable
-    max_token_size: int | None = None
-    send_dimensions: bool = False
-    model_name: str | None = (
-        None  # Model name for implementing workspace data isolation in vector DB
-    )
-
-    def __post_init__(self):
-        """Unwrap nested EmbeddingFunc to prevent double wrapping issues.
-
-        When an EmbeddingFunc wraps another EmbeddingFunc, the inner wrapper's
-        __call__ preprocessing would override the outer wrapper's settings.
-        This method detects and unwraps nested EmbeddingFunc instances to ensure
-        that only the outermost wrapper's configuration is applied.
-        """
-        # Check if func is already an EmbeddingFunc instance and unwrap it
-        max_unwrap_depth = 3  # Safety limit to prevent infinite loops
-        unwrap_count = 0
-        while isinstance(self.func, EmbeddingFunc):
-            unwrap_count += 1
-            if unwrap_count > max_unwrap_depth:
-                raise ValueError(
-                    f"EmbeddingFunc unwrap depth exceeded {max_unwrap_depth}. "
-                    "Possible circular reference detected."
-                )
-            # Unwrap to get the original function
-            self.func = self.func.func
-
-        if unwrap_count > 0:
-            logger.warning(
-                f"Detected nested EmbeddingFunc wrapping (depth: {unwrap_count}), "
-                "auto-unwrapped to prevent configuration conflicts. "
-                "Consider using .func to access the unwrapped function directly."
-            )
+    max_token_size: int | None = None  # deprecated keep it for compatible only
 
     async def __call__(self, *args, **kwargs) -> np.ndarray:
-        # Only inject embedding_dim when send_dimensions is True
-        if self.send_dimensions:
-            # Check if user provided embedding_dim parameter
-            if "embedding_dim" in kwargs:
-                user_provided_dim = kwargs["embedding_dim"]
-                # If user's value differs from class attribute, output warning
-                if (
-                    user_provided_dim is not None
-                    and user_provided_dim != self.embedding_dim
-                ):
-                    logger.warning(
-                        f"Ignoring user-provided embedding_dim={user_provided_dim}, "
-                        f"using declared embedding_dim={self.embedding_dim} from decorator"
-                    )
-
-            # Inject embedding_dim from decorator
-            kwargs["embedding_dim"] = self.embedding_dim
-
-        # Check if underlying function supports max_token_size and inject if not provided
-        if self.max_token_size is not None and "max_token_size" not in kwargs:
-            sig = inspect.signature(self.func)
-            if "max_token_size" in sig.parameters:
-                kwargs["max_token_size"] = self.max_token_size
-
-        # Call the actual embedding function
-        result = await self.func(*args, **kwargs)
-
-        # Validate embedding dimensions using total element count
-        total_elements = result.size  # Total number of elements in the numpy array
-        expected_dim = self.embedding_dim
-
-        # Check if total elements can be evenly divided by embedding_dim
-        if total_elements % expected_dim != 0:
-            raise ValueError(
-                f"Embedding dimension mismatch detected: "
-                f"total elements ({total_elements}) cannot be evenly divided by "
-                f"expected dimension ({expected_dim}). "
-            )
-
-        # Optional: Verify vector count matches input text count
-        actual_vectors = total_elements // expected_dim
-        if args and isinstance(args[0], (list, tuple)):
-            expected_vectors = len(args[0])
-            if actual_vectors != expected_vectors:
-                raise ValueError(
-                    f"Vector count mismatch: "
-                    f"expected {expected_vectors} vectors but got {actual_vectors} vectors (from embedding result)."
-                )
-
-        return result
+        return await self.func(*args, **kwargs)
 
 
 def compute_args_hash(*args: Any) -> str:
@@ -688,6 +508,7 @@ def priority_limit_async_func_call(
                                 task_id,
                                 args,
                                 kwargs,
+                                ctx,
                             ) = await asyncio.wait_for(queue.get(), timeout=1.0)
                         except asyncio.TimeoutError:
                             continue
@@ -717,11 +538,15 @@ def priority_limit_async_func_call(
                         try:
                             # Execute function with timeout protection
                             if max_execution_timeout is not None:
+                                # Run the function in the captured context
+                                task = ctx.run(lambda: asyncio.create_task(func(*args, **kwargs)))
                                 result = await asyncio.wait_for(
-                                    func(*args, **kwargs), timeout=max_execution_timeout
+                                    task, timeout=max_execution_timeout
                                 )
                             else:
-                                result = await func(*args, **kwargs)
+                                # Run the function in the captured context
+                                task = ctx.run(lambda: asyncio.create_task(func(*args, **kwargs)))
+                                result = await task
 
                             # Set result if future is still valid
                             if not task_state.future.done():
@@ -972,6 +797,9 @@ def priority_limit_async_func_call(
                 future=future, start_time=asyncio.get_event_loop().time()
             )
 
+            # Capture current context
+            ctx = contextvars.copy_context()
+
             try:
                 # Register task state
                 async with task_states_lock:
@@ -990,13 +818,13 @@ def priority_limit_async_func_call(
                     if _queue_timeout is not None:
                         await asyncio.wait_for(
                             queue.put(
-                                (_priority, current_count, task_id, args, kwargs)
+                                (_priority, current_count, task_id, args, kwargs, ctx)
                             ),
                             timeout=_queue_timeout,
                         )
                     else:
                         await queue.put(
-                            (_priority, current_count, task_id, args, kwargs)
+                            (_priority, current_count, task_id, args, kwargs, ctx)
                         )
                 except asyncio.TimeoutError:
                     raise QueueFullError(
@@ -1059,55 +887,7 @@ def priority_limit_async_func_call(
 
 
 def wrap_embedding_func_with_attrs(**kwargs):
-    """Decorator to add embedding dimension and token limit attributes to embedding functions.
-
-    This decorator wraps an async embedding function and returns an EmbeddingFunc instance
-    that automatically handles dimension parameter injection and attribute management.
-
-    WARNING: DO NOT apply this decorator to wrapper functions that call other
-    decorated embedding functions. This will cause double decoration and parameter
-    injection conflicts.
-
-    Correct usage patterns:
-
-    1. Direct decoration:
-        ```python
-        @wrap_embedding_func_with_attrs(embedding_dim=1536, max_token_size=8192, model_name="my_embedding_model")
-        async def my_embed(texts, embedding_dim=None):
-            # Direct implementation
-            return embeddings
-        ```
-    2. Double decoration:
-        ```python
-        @wrap_embedding_func_with_attrs(embedding_dim=1536, max_token_size=8192, model_name="my_embedding_model")
-        @retry(...)
-        async def my_embed(texts, ...):
-            # Base implementation
-            pass
-
-        @wrap_embedding_func_with_attrs(embedding_dim=1024, max_token_size=4096, model_name="another_embedding_model")
-        # Note: No @retry here!
-        async def my_new_embed(texts, ...):
-            # CRITICAL: Call .func to access unwrapped function
-            return await my_embed.func(texts, ...)  # ✅ Correct
-            # return await my_embed(texts, ...)     # ❌ Wrong - double decoration!
-        ```
-
-    The decorated function becomes an EmbeddingFunc instance with:
-    - embedding_dim: The embedding dimension
-    - max_token_size: Maximum token limit (optional)
-    - model_name: Model name (optional)
-    - func: The original unwrapped function (access via .func)
-    - __call__: Wrapper that injects embedding_dim parameter
-
-    Args:
-        embedding_dim: The dimension of embedding vectors
-        max_token_size: Maximum number of tokens (optional)
-        send_dimensions: Whether to pass embedding_dim as a keyword argument (for models with configurable embedding dimensions).
-
-    Returns:
-        A decorator that wraps the function as an EmbeddingFunc instance
-    """
+    """Wrap a function with attributes"""
 
     def final_decro(func) -> EmbeddingFunc:
         new_func = EmbeddingFunc(**kwargs, func=func)
@@ -1123,123 +903,9 @@ def load_json(file_name):
         return json.load(f)
 
 
-def _sanitize_string_for_json(text: str) -> str:
-    """Remove characters that cannot be encoded in UTF-8 for JSON serialization.
-
-    Uses regex for optimal performance with zero-copy optimization for clean strings.
-    Fast detection path for clean strings (99% of cases) with efficient removal for dirty strings.
-
-    Args:
-        text: String to sanitize
-
-    Returns:
-        Original string if clean (zero-copy), sanitized string if dirty
-    """
-    if not text:
-        return text
-
-    # Fast path: Check if sanitization is needed using C-level regex search
-    if not _SURROGATE_PATTERN.search(text):
-        return text  # Zero-copy for clean strings - most common case
-
-    # Slow path: Remove problematic characters using C-level regex substitution
-    return _SURROGATE_PATTERN.sub("", text)
-
-
-class SanitizingJSONEncoder(json.JSONEncoder):
-    """
-    Custom JSON encoder that sanitizes data during serialization.
-
-    This encoder cleans strings during the encoding process without creating
-    a full copy of the data structure, making it memory-efficient for large datasets.
-    """
-
-    def encode(self, o):
-        """Override encode method to handle simple string cases"""
-        if isinstance(o, str):
-            return json.encoder.encode_basestring(_sanitize_string_for_json(o))
-        return super().encode(o)
-
-    def iterencode(self, o, _one_shot=False):
-        """
-        Override iterencode to sanitize strings during serialization.
-        This is the core method that handles complex nested structures.
-        """
-        # Preprocess: sanitize all strings in the object
-        sanitized = self._sanitize_for_encoding(o)
-
-        # Call parent's iterencode with sanitized data
-        for chunk in super().iterencode(sanitized, _one_shot):
-            yield chunk
-
-    def _sanitize_for_encoding(self, obj):
-        """
-        Recursively sanitize strings in an object.
-        Creates new objects only when necessary to avoid deep copies.
-
-        Args:
-            obj: Object to sanitize
-
-        Returns:
-            Sanitized object with cleaned strings
-        """
-        if isinstance(obj, str):
-            return _sanitize_string_for_json(obj)
-
-        elif isinstance(obj, dict):
-            # Create new dict with sanitized keys and values
-            new_dict = {}
-            for k, v in obj.items():
-                clean_k = _sanitize_string_for_json(k) if isinstance(k, str) else k
-                clean_v = self._sanitize_for_encoding(v)
-                new_dict[clean_k] = clean_v
-            return new_dict
-
-        elif isinstance(obj, (list, tuple)):
-            # Sanitize list/tuple elements
-            cleaned = [self._sanitize_for_encoding(item) for item in obj]
-            return type(obj)(cleaned) if isinstance(obj, tuple) else cleaned
-
-        else:
-            # Numbers, booleans, None, etc. remain unchanged
-            return obj
-
-
 def write_json(json_obj, file_name):
-    """
-    Write JSON data to file with optimized sanitization strategy.
-
-    This function uses a two-stage approach:
-    1. Fast path: Try direct serialization (works for clean data ~99% of time)
-    2. Slow path: Use custom encoder that sanitizes during serialization
-
-    The custom encoder approach avoids creating a deep copy of the data,
-    making it memory-efficient. When sanitization occurs, the caller should
-    reload the cleaned data from the file to update shared memory.
-
-    Args:
-        json_obj: Object to serialize (may be a shallow copy from shared memory)
-        file_name: Output file path
-
-    Returns:
-        bool: True if sanitization was applied (caller should reload data),
-              False if direct write succeeded (no reload needed)
-    """
-    try:
-        # Strategy 1: Fast path - try direct serialization
-        with open(file_name, "w", encoding="utf-8") as f:
-            json.dump(json_obj, f, indent=2, ensure_ascii=False)
-        return False  # No sanitization needed, no reload required
-
-    except (UnicodeEncodeError, UnicodeDecodeError) as e:
-        logger.debug(f"Direct JSON write failed, using sanitizing encoder: {e}")
-
-    # Strategy 2: Use custom encoder (sanitizes during serialization, zero memory copy)
     with open(file_name, "w", encoding="utf-8") as f:
-        json.dump(json_obj, f, indent=2, ensure_ascii=False, cls=SanitizingJSONEncoder)
-
-    logger.info(f"JSON sanitization applied during write: {file_name}")
-    return True  # Sanitization applied, reload recommended
+        json.dump(json_obj, f, indent=2, ensure_ascii=False)
 
 
 class TokenizerInterface(Protocol):
@@ -1943,6 +1609,8 @@ async def use_llm_func_with_cache(
     cache_type: str = "extract",
     chunk_id: str | None = None,
     cache_keys_collector: list = None,
+    hashing_kv: "BaseKVStorage | None" = None,
+    token_tracker=None,
 ) -> tuple[str, int]:
     """Call LLM function with cache support and text sanitization
 
@@ -2026,8 +1694,15 @@ async def use_llm_func_with_cache(
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
 
+        # Note: token_tracker is NOT passed here because the LLM wrapper functions
+        # (e.g., optimized_openai_alike_model_complete in lightrag_server.py)
+        # already handle token_tracker directly. Passing it here would cause
+        # "got multiple values for keyword argument 'token_tracker'" error.
+
         res: str = await use_llm_func(
-            safe_user_prompt, system_prompt=safe_system_prompt, **kwargs
+            safe_user_prompt,
+            system_prompt=safe_system_prompt,
+            **kwargs,
         )
 
         res = remove_think_tags(res)
@@ -2060,9 +1735,16 @@ async def use_llm_func_with_cache(
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
 
+    # Note: token_tracker is NOT passed here because the LLM wrapper functions
+    # (e.g., optimized_openai_alike_model_complete in lightrag_server.py)
+    # already handle token_tracker directly. Passing it here would cause
+    # "got multiple values for keyword argument 'token_tracker'" error.
+
     try:
         res = await use_llm_func(
-            safe_user_prompt, system_prompt=safe_system_prompt, **kwargs
+            safe_user_prompt,
+            system_prompt=safe_system_prompt,
+            **kwargs,
         )
     except Exception as e:
         # Add [LLM func] prefix to error message
@@ -2126,7 +1808,7 @@ def normalize_extracted_info(name: str, remove_inner_quotes=False) -> str:
     - Filter out short numeric-only text (length < 3 and only digits/dots)
     - remove_inner_quotes = True
         remove Chinese quotes
-        remove English quotes in and around chinese
+        remove English queotes in and around chinese
         Convert non-breaking spaces to regular spaces
         Convert narrow non-breaking spaces after non-digits to regular spaces
 
@@ -2558,52 +2240,74 @@ async def pick_by_vector_similarity(
         return all_chunk_ids[:num_of_chunks]
 
 
+from contextvars import ContextVar
+
+
 class TokenTracker:
-    """Track token usage for LLM calls."""
+    """Track token usage for LLM calls using ContextVars for concurrency support."""
+
+    _usage_var: ContextVar[dict] = ContextVar("token_usage", default=None)
 
     def __init__(self):
-        self.reset()
+        # No instance state needed as we use ContextVar
+        pass
 
     def __enter__(self):
         self.reset()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        print(self)
+        # Optional: Log usage on exit if needed
+        pass
 
     def reset(self):
-        self.prompt_tokens = 0
-        self.completion_tokens = 0
-        self.total_tokens = 0
-        self.call_count = 0
+        """Initialize/Reset token usage for the current context."""
+        self._usage_var.set(
+            {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "call_count": 0,
+            }
+        )
 
-    def add_usage(self, token_counts):
+    def _get_current_usage(self) -> dict:
+        """Get the usage dict for the current context, initializing if necessary."""
+        usage = self._usage_var.get()
+        if usage is None:
+            usage = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "call_count": 0,
+            }
+            self._usage_var.set(usage)
+        return usage
+
+    def add_usage(self, token_counts: dict):
         """Add token usage from one LLM call.
 
         Args:
             token_counts: A dictionary containing prompt_tokens, completion_tokens, total_tokens
         """
-        self.prompt_tokens += token_counts.get("prompt_tokens", 0)
-        self.completion_tokens += token_counts.get("completion_tokens", 0)
+        usage = self._get_current_usage()
+
+        usage["prompt_tokens"] += token_counts.get("prompt_tokens", 0)
+        usage["completion_tokens"] += token_counts.get("completion_tokens", 0)
 
         # If total_tokens is provided, use it directly; otherwise calculate the sum
         if "total_tokens" in token_counts:
-            self.total_tokens += token_counts["total_tokens"]
+            usage["total_tokens"] += token_counts["total_tokens"]
         else:
-            self.total_tokens += token_counts.get(
+            usage["total_tokens"] += token_counts.get(
                 "prompt_tokens", 0
             ) + token_counts.get("completion_tokens", 0)
 
-        self.call_count += 1
+        usage["call_count"] += 1
 
     def get_usage(self):
         """Get current usage statistics."""
-        return {
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "total_tokens": self.total_tokens,
-            "call_count": self.call_count,
-        }
+        return self._get_current_usage().copy()
 
     def __str__(self):
         usage = self.get_usage()
@@ -2613,6 +2317,26 @@ class TokenTracker:
             f"Completion tokens: {usage['completion_tokens']}, "
             f"Total tokens: {usage['total_tokens']}"
         )
+
+
+def estimate_embedding_tokens(texts: list[str], tokenizer: Tokenizer) -> int:
+    """Estimate tokens for embedding operations based on text length.
+
+    Most embedding APIs don't return token counts, so we estimate based on
+    the tokenizer encoding. This provides a reasonable approximation for tracking.
+
+    Args:
+        texts: List of text strings to be embedded
+        tokenizer: Tokenizer instance for encoding
+
+    Returns:
+        Estimated total token count for all texts
+    """
+    total = 0
+    for text in texts:
+        if text:  # Skip empty strings
+            total += len(tokenizer.encode(text))
+    return total
 
 
 async def apply_rerank_if_enabled(
@@ -2808,156 +2532,63 @@ async def process_chunks_unified(
     return final_chunks
 
 
-def normalize_source_ids_limit_method(method: str | None) -> str:
-    """Normalize the source ID limiting strategy and fall back to default when invalid."""
-
-    if not method:
-        return DEFAULT_SOURCE_IDS_LIMIT_METHOD
-
-    normalized = method.upper()
-    if normalized not in VALID_SOURCE_IDS_LIMIT_METHODS:
-        logger.warning(
-            "Unknown SOURCE_IDS_LIMIT_METHOD '%s', falling back to %s",
-            method,
-            DEFAULT_SOURCE_IDS_LIMIT_METHOD,
-        )
-        return DEFAULT_SOURCE_IDS_LIMIT_METHOD
-
-    return normalized
-
-
-def merge_source_ids(
-    existing_ids: Iterable[str] | None, new_ids: Iterable[str] | None
-) -> list[str]:
-    """Merge two iterables of source IDs while preserving order and removing duplicates."""
-
-    merged: list[str] = []
-    seen: set[str] = set()
-
-    for sequence in (existing_ids, new_ids):
-        if not sequence:
-            continue
-        for source_id in sequence:
-            if not source_id:
-                continue
-            if source_id not in seen:
-                seen.add(source_id)
-                merged.append(source_id)
-
-    return merged
-
-
-def apply_source_ids_limit(
-    source_ids: Sequence[str],
-    limit: int,
-    method: str,
-    *,
-    identifier: str | None = None,
-) -> list[str]:
-    """Apply a limit strategy to a sequence of source IDs."""
-
-    if limit <= 0:
-        return []
-
-    source_ids_list = list(source_ids)
-    if len(source_ids_list) <= limit:
-        return source_ids_list
-
-    normalized_method = normalize_source_ids_limit_method(method)
-
-    if normalized_method == SOURCE_IDS_LIMIT_METHOD_FIFO:
-        truncated = source_ids_list[-limit:]
-    else:  # IGNORE_NEW
-        truncated = source_ids_list[:limit]
-
-    if identifier and len(truncated) < len(source_ids_list):
-        logger.debug(
-            "Source_id truncated: %s | %s keeping %s of %s entries",
-            identifier,
-            normalized_method,
-            len(truncated),
-            len(source_ids_list),
-        )
-
-    return truncated
-
-
-def compute_incremental_chunk_ids(
-    existing_full_chunk_ids: list[str],
-    old_chunk_ids: list[str],
-    new_chunk_ids: list[str],
-) -> list[str]:
-    """
-    Compute incrementally updated chunk IDs based on changes.
-
-    This function applies delta changes (additions and removals) to an existing
-    list of chunk IDs while maintaining order and ensuring deduplication.
-    Delta additions from new_chunk_ids are placed at the end.
+def build_file_path(already_file_paths, data_list, target):
+    """Build file path string with UTF-8 byte length limit and deduplication
 
     Args:
-        existing_full_chunk_ids: Complete list of existing chunk IDs from storage
-        old_chunk_ids: Previous chunk IDs from source_id (chunks being replaced)
-        new_chunk_ids: New chunk IDs from updated source_id (chunks being added)
+        already_file_paths: List of existing file paths
+        data_list: List of data items containing file_path
+        target: Target name for logging warnings
 
     Returns:
-        Updated list of chunk IDs with deduplication
-
-    Example:
-        >>> existing = ['chunk-1', 'chunk-2', 'chunk-3']
-        >>> old = ['chunk-1', 'chunk-2']
-        >>> new = ['chunk-2', 'chunk-4']
-        >>> compute_incremental_chunk_ids(existing, old, new)
-        ['chunk-3', 'chunk-2', 'chunk-4']
+        str: Combined file paths separated by GRAPH_FIELD_SEP
     """
-    # Calculate changes
-    chunks_to_remove = set(old_chunk_ids) - set(new_chunk_ids)
-    chunks_to_add = set(new_chunk_ids) - set(old_chunk_ids)
+    # set: deduplication
+    file_paths_set = {fp for fp in already_file_paths if fp}
 
-    # Apply changes to full chunk_ids
-    # Step 1: Remove chunks that are no longer needed
-    updated_chunk_ids = [
-        cid for cid in existing_full_chunk_ids if cid not in chunks_to_remove
-    ]
+    # string: filter empty value and keep file order in already_file_paths
+    file_paths = GRAPH_FIELD_SEP.join(fp for fp in already_file_paths if fp)
 
-    # Step 2: Add new chunks (preserving order from new_chunk_ids)
-    # Note: 'cid not in updated_chunk_ids' check ensures deduplication
-    for cid in new_chunk_ids:
-        if cid in chunks_to_add and cid not in updated_chunk_ids:
-            updated_chunk_ids.append(cid)
+    # Check if initial file_paths already exceeds byte length limit
+    if len(file_paths.encode("utf-8")) >= DEFAULT_MAX_FILE_PATH_LENGTH:
+        logger.warning(
+            f"Initial file_paths already exceeds {DEFAULT_MAX_FILE_PATH_LENGTH} bytes for {target}, "
+            f"current size: {len(file_paths.encode('utf-8'))} bytes"
+        )
 
-    return updated_chunk_ids
+    # ignored file_paths
+    file_paths_ignore = ""
+    # add file_paths
+    for dp in data_list:
+        cur_file_path = dp.get("file_path")
+        # empty
+        if not cur_file_path:
+            continue
 
+        # skip duplicate item
+        if cur_file_path in file_paths_set:
+            continue
+        # add
+        file_paths_set.add(cur_file_path)
 
-def subtract_source_ids(
-    source_ids: Iterable[str],
-    ids_to_remove: Collection[str],
-) -> list[str]:
-    """Remove a collection of IDs from an ordered iterable while preserving order."""
+        # check the UTF-8 byte length
+        new_addition = GRAPH_FIELD_SEP + cur_file_path if file_paths else cur_file_path
+        if (
+            len(file_paths.encode("utf-8")) + len(new_addition.encode("utf-8"))
+            < DEFAULT_MAX_FILE_PATH_LENGTH - 5
+        ):
+            # append
+            file_paths += new_addition
+        else:
+            # ignore
+            file_paths_ignore += GRAPH_FIELD_SEP + cur_file_path
 
-    removal_set = set(ids_to_remove)
-    if not removal_set:
-        return [source_id for source_id in source_ids if source_id]
-
-    return [
-        source_id
-        for source_id in source_ids
-        if source_id and source_id not in removal_set
-    ]
-
-
-def make_relation_chunk_key(src: str, tgt: str) -> str:
-    """Create a deterministic storage key for relation chunk tracking."""
-
-    return GRAPH_FIELD_SEP.join(sorted((src, tgt)))
-
-
-def parse_relation_chunk_key(key: str) -> tuple[str, str]:
-    """Parse a relation chunk storage key back into its entity pair."""
-
-    parts = key.split(GRAPH_FIELD_SEP)
-    if len(parts) != 2:
-        raise ValueError(f"Invalid relation chunk key: {key}")
-    return parts[0], parts[1]
+    if file_paths_ignore:
+        logger.warning(
+            f"File paths exceed {DEFAULT_MAX_FILE_PATH_LENGTH} bytes for {target}, "
+            f"ignoring file path: {file_paths_ignore}"
+        )
+    return file_paths
 
 
 def generate_track_id(prefix: str = "upload") -> str:
@@ -3047,9 +2678,9 @@ def fix_tuple_delimiter_corruption(
         record,
     )
 
-    # Fix: <X|#|> -> <|#|>, <|#|Y> -> <|#|>, <X|#|Y> -> <|#|>, <||#||> -> <|#|> (one extra characters outside pipes)
+    # Fix: <X|#|> -> <|#|>, <|#|Y> -> <|#|>, <X|#|Y> -> <|#|>, <||#||> -> <|#|>, <||#> -> <|#|> (one extra characters outside pipes)
     record = re.sub(
-        rf"<.?\|{escaped_delimiter_core}\|.?>",
+        rf"<.?\|{escaped_delimiter_core}\|*?>",
         tuple_delimiter,
         record,
     )
@@ -3069,6 +2700,7 @@ def fix_tuple_delimiter_corruption(
     )
 
     # Fix: <|#| -> <|#|>, <|#|| -> <|#|> (missing closing >)
+
     record = re.sub(
         rf"<\|{escaped_delimiter_core}\|+(?!>)",
         tuple_delimiter,
@@ -3078,13 +2710,6 @@ def fix_tuple_delimiter_corruption(
     # Fix <|#: -> <|#|> (missing closing >)
     record = re.sub(
         rf"<\|{escaped_delimiter_core}:(?!>)",
-        tuple_delimiter,
-        record,
-    )
-
-    # Fix: <||#> -> <|#|> (double pipe at start, missing pipe at end)
-    record = re.sub(
-        rf"<\|+{escaped_delimiter_core}>",
         tuple_delimiter,
         record,
     )

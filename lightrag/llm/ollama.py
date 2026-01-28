@@ -1,6 +1,4 @@
 from collections.abc import AsyncIterator
-import os
-import re
 
 import pipmaster as pm
 
@@ -24,31 +22,8 @@ from lightrag.exceptions import (
 from lightrag.api import __api_version__
 
 import numpy as np
-from typing import Optional, Union
-from lightrag.utils import (
-    wrap_embedding_func_with_attrs,
-    logger,
-)
-
-
-_OLLAMA_CLOUD_HOST = "https://ollama.com"
-_CLOUD_MODEL_SUFFIX_PATTERN = re.compile(r"(?:-cloud|:cloud)$")
-
-
-def _coerce_host_for_cloud_model(host: Optional[str], model: object) -> Optional[str]:
-    if host:
-        return host
-    try:
-        model_name_str = str(model) if model is not None else ""
-    except (TypeError, ValueError, AttributeError) as e:
-        logger.warning(f"Failed to convert model to string: {e}, using empty string")
-        model_name_str = ""
-    if _CLOUD_MODEL_SUFFIX_PATTERN.search(model_name_str):
-        logger.debug(
-            f"Detected cloud model '{model_name_str}', using Ollama Cloud host"
-        )
-        return _OLLAMA_CLOUD_HOST
-    return host
+from typing import Union
+from lightrag.utils import logger
 
 
 @retry(
@@ -64,6 +39,7 @@ async def _ollama_model_if_cache(
     system_prompt=None,
     history_messages=[],
     enable_cot: bool = False,
+    token_tracker=None,
     **kwargs,
 ) -> Union[str, AsyncIterator[str]]:
     if enable_cot:
@@ -78,17 +54,12 @@ async def _ollama_model_if_cache(
         timeout = None
     kwargs.pop("hashing_kv", None)
     api_key = kwargs.pop("api_key", None)
-    # fallback to environment variable when not provided explicitly
-    if not api_key:
-        api_key = os.getenv("OLLAMA_API_KEY")
     headers = {
         "Content-Type": "application/json",
         "User-Agent": f"LightRAG/{__api_version__}",
     }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-
-    host = _coerce_host_for_cloud_model(host, model)
 
     ollama_client = ollama.AsyncClient(host=host, timeout=timeout, headers=headers)
 
@@ -104,13 +75,47 @@ async def _ollama_model_if_cache(
             """cannot cache stream response and process reasoning"""
 
             async def inner():
+                accumulated_response = ""
                 try:
                     async for chunk in response:
-                        yield chunk["message"]["content"]
+                        chunk_content = chunk["message"]["content"]
+                        accumulated_response += chunk_content
+                        yield chunk_content
                 except Exception as e:
                     logger.error(f"Error in stream response: {str(e)}")
                     raise
                 finally:
+                    # Track token usage for streaming if token tracker is provided
+                    if token_tracker:
+                        # Estimate prompt tokens: roughly 4 characters per token for English text
+                        prompt_text = ""
+                        if system_prompt:
+                            prompt_text += system_prompt + " "
+                        prompt_text += (
+                            " ".join(
+                                [msg.get("content", "") for msg in history_messages]
+                            )
+                            + " "
+                        )
+                        prompt_text += prompt
+                        prompt_tokens = len(prompt_text) // 4 + (
+                            1 if len(prompt_text) % 4 else 0
+                        )
+
+                        # Estimate completion tokens from accumulated response
+                        completion_tokens = len(accumulated_response) // 4 + (
+                            1 if len(accumulated_response) % 4 else 0
+                        )
+                        total_tokens = prompt_tokens + completion_tokens
+
+                        token_tracker.add_usage(
+                            {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": total_tokens,
+                            }
+                        )
+
                     try:
                         await ollama_client._client.aclose()
                         logger.debug("Successfully closed Ollama client for streaming")
@@ -120,6 +125,35 @@ async def _ollama_model_if_cache(
             return inner()
         else:
             model_response = response["message"]["content"]
+
+            # Track token usage if token tracker is provided
+            # Note: Ollama doesn't provide token usage in chat responses, so we estimate
+            if token_tracker:
+                # Estimate prompt tokens: roughly 4 characters per token for English text
+                prompt_text = ""
+                if system_prompt:
+                    prompt_text += system_prompt + " "
+                prompt_text += (
+                    " ".join([msg.get("content", "") for msg in history_messages]) + " "
+                )
+                prompt_text += prompt
+                prompt_tokens = len(prompt_text) // 4 + (
+                    1 if len(prompt_text) % 4 else 0
+                )
+
+                # Estimate completion tokens from response
+                completion_tokens = len(model_response) // 4 + (
+                    1 if len(model_response) % 4 else 0
+                )
+                total_tokens = prompt_tokens + completion_tokens
+
+                token_tracker.add_usage(
+                    {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": total_tokens,
+                    }
+                )
 
             """
             If the model also wraps its thoughts in a specific tag,
@@ -156,6 +190,7 @@ async def ollama_model_complete(
     history_messages=[],
     enable_cot: bool = False,
     keyword_extraction=False,
+    token_tracker=None,
     **kwargs,
 ) -> Union[str, AsyncIterator[str]]:
     keyword_extraction = kwargs.pop("keyword_extraction", None)
@@ -168,44 +203,15 @@ async def ollama_model_complete(
         system_prompt=system_prompt,
         history_messages=history_messages,
         enable_cot=enable_cot,
+        token_tracker=token_tracker,
         **kwargs,
     )
 
 
-@wrap_embedding_func_with_attrs(
-    embedding_dim=1024, max_token_size=8192, model_name="bge-m3:latest"
-)
 async def ollama_embed(
-    texts: list[str],
-    embed_model: str = "bge-m3:latest",
-    max_token_size: int | None = None,
-    **kwargs,
+    texts: list[str], embed_model, token_tracker=None, **kwargs
 ) -> np.ndarray:
-    """Generate embeddings using Ollama's API.
-
-    Args:
-        texts: List of texts to embed.
-        embed_model: The Ollama embedding model to use. Default is "bge-m3:latest".
-        max_token_size: Maximum tokens per text. This parameter is automatically
-            injected by the EmbeddingFunc wrapper when the underlying function
-            signature supports it (via inspect.signature check). Ollama will
-            automatically truncate texts exceeding the model's context length
-            (num_ctx), so no client-side truncation is needed.
-        **kwargs: Additional arguments passed to the Ollama client.
-
-    Returns:
-        A numpy array of embeddings, one per input text.
-
-    Note:
-        - Ollama API automatically truncates texts exceeding the model's context length
-        - The max_token_size parameter is received but not used for client-side truncation
-    """
-    # Note: max_token_size is received but not used for client-side truncation.
-    # Ollama API handles truncation automatically based on the model's num_ctx setting.
-    _ = max_token_size  # Acknowledge parameter to avoid unused variable warning
     api_key = kwargs.pop("api_key", None)
-    if not api_key:
-        api_key = os.getenv("OLLAMA_API_KEY")
     headers = {
         "Content-Type": "application/json",
         "User-Agent": f"LightRAG/{__api_version__}",
@@ -216,14 +222,27 @@ async def ollama_embed(
     host = kwargs.pop("host", None)
     timeout = kwargs.pop("timeout", None)
 
-    host = _coerce_host_for_cloud_model(host, embed_model)
-
     ollama_client = ollama.AsyncClient(host=host, timeout=timeout, headers=headers)
     try:
         options = kwargs.pop("options", {})
         data = await ollama_client.embed(
             model=embed_model, input=texts, options=options
         )
+
+        # Track token usage if token tracker is provided
+        # Note: Ollama doesn't provide token usage in embedding responses, so we estimate
+        if token_tracker:
+            # Estimate tokens: roughly 4 characters per token for English text
+            total_chars = sum(len(text) for text in texts)
+            estimated_tokens = total_chars // 4 + (1 if total_chars % 4 else 0)
+            token_tracker.add_usage(
+                {
+                    "prompt_tokens": estimated_tokens,
+                    "completion_tokens": 0,
+                    "total_tokens": estimated_tokens,
+                }
+            )
+
         return np.array(data["embeddings"])
     except Exception as e:
         logger.error(f"Error in ollama_embed: {str(e)}")

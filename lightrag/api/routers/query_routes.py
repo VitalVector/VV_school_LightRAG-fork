@@ -3,12 +3,16 @@ This module contains all query-related routes for the LightRAG API.
 """
 
 import json
+import logging
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, Depends, HTTPException
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from lightrag.base import QueryParam
+from lightrag.types import MetadataFilter
 from lightrag.api.utils_api import get_combined_auth_dependency
-from lightrag.utils import logger
 from pydantic import BaseModel, Field, field_validator
+
+from ascii_colors import trace_exception
 
 router = APIRouter(tags=["query"])
 
@@ -17,6 +21,11 @@ class QueryRequest(BaseModel):
     query: str = Field(
         min_length=3,
         description="The query text",
+    )
+
+    metadata_filter: MetadataFilter | None = Field(
+        default=None,
+        description="Optional metadata filter for nodes and edges. Can be a MetadataFilter object or a dict that will be converted to MetadataFilter.",
     )
 
     mode: Literal["local", "global", "hybrid", "naive", "mix", "bypass"] = Field(
@@ -70,19 +79,9 @@ class QueryRequest(BaseModel):
         ge=1,
     )
 
-    hl_keywords: list[str] = Field(
-        default_factory=list,
-        description="List of high-level keywords to prioritize in retrieval. Leave empty to use the LLM to generate the keywords.",
-    )
-
-    ll_keywords: list[str] = Field(
-        default_factory=list,
-        description="List of low-level keywords to refine retrieval focus. Leave empty to use the LLM to generate the keywords.",
-    )
-
     conversation_history: Optional[List[Dict[str, Any]]] = Field(
-        default=None,
-        description="History messages are only sent to LLM for context, not used for retrieval. Format: [{'role': 'user/assistant', 'content': 'message'}].",
+        default=[],
+        description="Stores past conversation history to maintain context. Format: [{'role': 'user/assistant', 'content': 'message'}].",
     )
 
     user_prompt: Optional[str] = Field(
@@ -98,11 +97,6 @@ class QueryRequest(BaseModel):
     include_references: Optional[bool] = Field(
         default=True,
         description="If True, includes reference list in responses. Affects /query and /query/stream endpoints. /query/data always includes references.",
-    )
-
-    include_chunk_content: Optional[bool] = Field(
-        default=False,
-        description="If True, includes actual chunk text content in references. Only applies when include_references=True. Useful for evaluation and debugging.",
     )
 
     stream: Optional[bool] = Field(
@@ -129,38 +123,43 @@ class QueryRequest(BaseModel):
                 raise ValueError("Each message 'role' must be a non-empty string.")
         return conversation_history
 
+    @field_validator("metadata_filter", mode="before")
+    @classmethod
+    def metadata_filter_convert(cls, v):
+        """Convert dict inputs to MetadataFilter objects."""
+        if v is None:
+            return None
+        if isinstance(v, dict):
+            return MetadataFilter.from_dict(v)
+        return v
+
     def to_query_params(self, is_stream: bool) -> "QueryParam":
         """Converts a QueryRequest instance into a QueryParam instance."""
         # Use Pydantic's `.model_dump(exclude_none=True)` to remove None values automatically
-        # Exclude API-level parameters that don't belong in QueryParam
-        request_data = self.model_dump(
-            exclude_none=True, exclude={"query", "include_chunk_content"}
-        )
+        request_data = self.model_dump(exclude_none=True, exclude={"query"})
 
         # Ensure `mode` and `stream` are set explicitly
         param = QueryParam(**request_data)
         param.stream = is_stream
+
+        # Ensure metadata_filter remains as MetadataFilter object if it exists
+        if self.metadata_filter:
+            param.metadata_filter = self.metadata_filter
+
         return param
-
-
-class ReferenceItem(BaseModel):
-    """A single reference item in query responses."""
-
-    reference_id: str = Field(description="Unique reference identifier")
-    file_path: str = Field(description="Path to the source file")
-    content: Optional[List[str]] = Field(
-        default=None,
-        description="List of chunk contents from this file (only present when include_chunk_content=True)",
-    )
 
 
 class QueryResponse(BaseModel):
     response: str = Field(
         description="The generated response",
     )
-    references: Optional[List[ReferenceItem]] = Field(
+    references: Optional[List[Dict[str, str]]] = Field(
         default=None,
         description="Reference list (Disabled when include_references=False, /query/data always includes references.)",
+    )
+    token_usage: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="Token usage statistics for the query (prompt_tokens, completion_tokens, total_tokens)",
     )
 
 
@@ -172,6 +171,10 @@ class QueryDataResponse(BaseModel):
     )
     metadata: Dict[str, Any] = Field(
         description="Query metadata including mode, keywords, and processing information"
+    )
+    token_usage: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="Token usage statistics for the query (prompt_tokens, completion_tokens, total_tokens)",
     )
 
 
@@ -188,9 +191,18 @@ class StreamChunkResponse(BaseModel):
     error: Optional[str] = Field(
         default=None, description="Error message if processing fails"
     )
+    token_usage: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="Token usage statistics for the entire query (only in final chunk)",
+    )
 
 
-def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
+def create_query_routes(
+    rag,
+    api_key: Optional[str] = None,
+    top_k: int = 60,
+    token_tracker: Optional[Any] = None,
+):
     combined_auth = get_combined_auth_dependency(api_key)
 
     @router.post(
@@ -216,11 +228,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                                         "properties": {
                                             "reference_id": {"type": "string"},
                                             "file_path": {"type": "string"},
-                                            "content": {
-                                                "type": "array",
-                                                "items": {"type": "string"},
-                                                "description": "List of chunk contents from this file (only included when include_chunk_content=True)",
-                                            },
                                         },
                                     },
                                     "description": "Reference list (only included when include_references=True)",
@@ -230,7 +237,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                         },
                         "examples": {
                             "with_references": {
-                                "summary": "Response with references",
+                                "summary": "Response with references and token usage",
                                 "description": "Example response when include_references=True",
                                 "value": {
                                     "response": "Artificial Intelligence (AI) is a branch of computer science that aims to create intelligent machines capable of performing tasks that typically require human intelligence, such as learning, reasoning, and problem-solving.",
@@ -244,37 +251,25 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                                             "file_path": "/documents/machine_learning.txt",
                                         },
                                     ],
-                                },
-                            },
-                            "with_chunk_content": {
-                                "summary": "Response with chunk content",
-                                "description": "Example response when include_references=True and include_chunk_content=True. Note: content is an array of chunks from the same file.",
-                                "value": {
-                                    "response": "Artificial Intelligence (AI) is a branch of computer science that aims to create intelligent machines capable of performing tasks that typically require human intelligence, such as learning, reasoning, and problem-solving.",
-                                    "references": [
-                                        {
-                                            "reference_id": "1",
-                                            "file_path": "/documents/ai_overview.pdf",
-                                            "content": [
-                                                "Artificial Intelligence (AI) represents a transformative field in computer science focused on creating systems that can perform tasks requiring human-like intelligence. These tasks include learning from experience, understanding natural language, recognizing patterns, and making decisions.",
-                                                "AI systems can be categorized into narrow AI, which is designed for specific tasks, and general AI, which aims to match human cognitive abilities across a wide range of domains.",
-                                            ],
-                                        },
-                                        {
-                                            "reference_id": "2",
-                                            "file_path": "/documents/machine_learning.txt",
-                                            "content": [
-                                                "Machine learning is a subset of AI that enables computers to learn and improve from experience without being explicitly programmed. It focuses on the development of algorithms that can access data and use it to learn for themselves."
-                                            ],
-                                        },
-                                    ],
+                                    "token_usage": {
+                                        "prompt_tokens": 245,
+                                        "completion_tokens": 87,
+                                        "total_tokens": 332,
+                                        "call_count": 1,
+                                    },
                                 },
                             },
                             "without_references": {
-                                "summary": "Response without references",
+                                "summary": "Response without references but with token usage",
                                 "description": "Example response when include_references=False",
                                 "value": {
-                                    "response": "Artificial Intelligence (AI) is a branch of computer science that aims to create intelligent machines capable of performing tasks that typically require human intelligence, such as learning, reasoning, and problem-solving."
+                                    "response": "Artificial Intelligence (AI) is a branch of computer science that aims to create intelligent machines capable of performing tasks that typically require human intelligence, such as learning, reasoning, and problem-solving.",
+                                    "token_usage": {
+                                        "prompt_tokens": 245,
+                                        "completion_tokens": 87,
+                                        "total_tokens": 332,
+                                        "call_count": 1,
+                                    },
                                 },
                             },
                             "different_modes": {
@@ -349,16 +344,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         }
         ```
 
-        Bypass initial LLM call by providing high-level and low-level keywords:
-        ```json
-        {
-            "query": "What is Retrieval-Augmented-Generation?",
-            "hl_keywords": ["machine learning", "information retrieval", "natural language processing"],
-            "ll_keywords": ["retrieval augmented generation", "RAG", "knowledge base"],
-            "mode": "mix"
-        }
-        ```
-
         Advanced query with references:
         ```json
         {
@@ -402,6 +387,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 - 500: Internal processing error (e.g., LLM service unavailable)
         """
         try:
+            # Reset token tracker at start of query if available
+            if token_tracker:
+                token_tracker.reset()
+
             param = request.to_query_params(
                 False
             )  # Ensure stream=False for non-streaming endpoint
@@ -413,44 +402,31 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
             # Extract LLM response and references from unified result
             llm_response = result.get("llm_response", {})
-            data = result.get("data", {})
-            references = data.get("references", [])
+            references = result.get("data", {}).get("references", [])
 
             # Get the non-streaming response content
             response_content = llm_response.get("content", "")
             if not response_content:
                 response_content = "No relevant context found for the query."
 
-            # Enrich references with chunk content if requested
-            if request.include_references and request.include_chunk_content:
-                chunks = data.get("chunks", [])
-                # Create a mapping from reference_id to chunk content
-                ref_id_to_content = {}
-                for chunk in chunks:
-                    ref_id = chunk.get("reference_id", "")
-                    content = chunk.get("content", "")
-                    if ref_id and content:
-                        # Collect chunk content; join later to avoid quadratic string concatenation
-                        ref_id_to_content.setdefault(ref_id, []).append(content)
-
-                # Add content to references
-                enriched_references = []
-                for ref in references:
-                    ref_copy = ref.copy()
-                    ref_id = ref.get("reference_id", "")
-                    if ref_id in ref_id_to_content:
-                        # Keep content as a list of chunks (one file may have multiple chunks)
-                        ref_copy["content"] = ref_id_to_content[ref_id]
-                    enriched_references.append(ref_copy)
-                references = enriched_references
+            # Get token usage if available
+            token_usage = None
+            if token_tracker:
+                token_usage = token_tracker.get_usage()
 
             # Return response with or without references based on request
             if request.include_references:
-                return QueryResponse(response=response_content, references=references)
+                return QueryResponse(
+                    response=response_content,
+                    references=references,
+                    token_usage=token_usage,
+                )
             else:
-                return QueryResponse(response=response_content, references=None)
+                return QueryResponse(
+                    response=response_content, references=None, token_usage=token_usage
+                )
         except Exception as e:
-            logger.error(f"Error processing query: {str(e)}", exc_info=True)
+            trace_exception(e)
             raise HTTPException(status_code=500, detail=str(e))
 
     @router.post(
@@ -472,11 +448,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                                 "summary": "Streaming mode with references (stream=true)",
                                 "description": "Multiple NDJSON lines when stream=True and include_references=True. First line contains references, subsequent lines contain response chunks.",
                                 "value": '{"references": [{"reference_id": "1", "file_path": "/documents/ai_overview.pdf"}, {"reference_id": "2", "file_path": "/documents/ml_basics.txt"}]}\n{"response": "Artificial Intelligence (AI) is a branch of computer science"}\n{"response": " that aims to create intelligent machines capable of performing"}\n{"response": " tasks that typically require human intelligence, such as learning,"}\n{"response": " reasoning, and problem-solving."}',
-                            },
-                            "streaming_with_chunk_content": {
-                                "summary": "Streaming mode with chunk content (stream=true, include_chunk_content=true)",
-                                "description": "Multiple NDJSON lines when stream=True, include_references=True, and include_chunk_content=True. First line contains references with content arrays (one file may have multiple chunks), subsequent lines contain response chunks.",
-                                "value": '{"references": [{"reference_id": "1", "file_path": "/documents/ai_overview.pdf", "content": ["Artificial Intelligence (AI) represents a transformative field...", "AI systems can be categorized into narrow AI and general AI..."]}, {"reference_id": "2", "file_path": "/documents/ml_basics.txt", "content": ["Machine learning is a subset of AI that enables computers to learn..."]}]}\n{"response": "Artificial Intelligence (AI) is a branch of computer science"}\n{"response": " that aims to create intelligent machines capable of performing"}\n{"response": " tasks that typically require human intelligence."}',
                             },
                             "streaming_without_references": {
                                 "summary": "Streaming mode without references (stream=true)",
@@ -576,16 +547,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         }
         ```
 
-        Bypass initial LLM call by providing high-level and low-level keywords:
-        ```json
-        {
-            "query": "What is Retrieval-Augmented-Generation?",
-            "hl_keywords": ["machine learning", "information retrieval", "natural language processing"],
-            "ll_keywords": ["retrieval augmented generation", "RAG", "knowledge base"],
-            "mode": "mix"
-        }
-        ```
-
         Complete response query:
         ```json
         {
@@ -660,6 +621,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             Use streaming mode for real-time interfaces and non-streaming for batch processing.
         """
         try:
+            # Reset token tracker at start of query if available
+            if token_tracker:
+                token_tracker.reset()
+
             # Use the stream parameter from the request, defaulting to True if not specified
             stream_mode = request.stream if request.stream is not None else True
             param = request.to_query_params(stream_mode)
@@ -674,30 +639,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 references = result.get("data", {}).get("references", [])
                 llm_response = result.get("llm_response", {})
 
-                # Enrich references with chunk content if requested
-                if request.include_references and request.include_chunk_content:
-                    data = result.get("data", {})
-                    chunks = data.get("chunks", [])
-                    # Create a mapping from reference_id to chunk content
-                    ref_id_to_content = {}
-                    for chunk in chunks:
-                        ref_id = chunk.get("reference_id", "")
-                        content = chunk.get("content", "")
-                        if ref_id and content:
-                            # Collect chunk content
-                            ref_id_to_content.setdefault(ref_id, []).append(content)
-
-                    # Add content to references
-                    enriched_references = []
-                    for ref in references:
-                        ref_copy = ref.copy()
-                        ref_id = ref.get("reference_id", "")
-                        if ref_id in ref_id_to_content:
-                            # Keep content as a list of chunks (one file may have multiple chunks)
-                            ref_copy["content"] = ref_id_to_content[ref_id]
-                        enriched_references.append(ref_copy)
-                    references = enriched_references
-
                 if llm_response.get("is_streaming"):
                     # Streaming mode: send references first, then stream response chunks
                     if request.include_references:
@@ -710,8 +651,12 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                                 if chunk:  # Only send non-empty content
                                     yield f"{json.dumps({'response': chunk})}\n"
                         except Exception as e:
-                            logger.error(f"Streaming error: {str(e)}")
+                            logging.error(f"Streaming error: {str(e)}")
                             yield f"{json.dumps({'error': str(e)})}\n"
+
+                    # Add final token usage chunk if streaming and token tracker is available
+                    if token_tracker and llm_response.get("is_streaming"):
+                        yield f"{json.dumps({'token_usage': token_tracker.get_usage()})}\n"
                 else:
                     # Non-streaming mode: send complete response in one message
                     response_content = llm_response.get("content", "")
@@ -722,6 +667,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     complete_response = {"response": response_content}
                     if request.include_references:
                         complete_response["references"] = references
+
+                    # Add token usage if available
+                    if token_tracker:
+                        complete_response["token_usage"] = token_tracker.get_usage()
 
                     yield f"{json.dumps(complete_response)}\n"
 
@@ -736,7 +685,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 },
             )
         except Exception as e:
-            logger.error(f"Error processing streaming query: {str(e)}", exc_info=True)
+            trace_exception(e)
             raise HTTPException(status_code=500, detail=str(e))
 
     @router.post(
@@ -1096,16 +1045,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         }
         ```
 
-        Bypass initial LLM call by providing high-level and low-level keywords:
-        ```json
-        {
-            "query": "What is Retrieval-Augmented-Generation?",
-            "hl_keywords": ["machine learning", "information retrieval", "natural language processing"],
-            "ll_keywords": ["retrieval augmented generation", "RAG", "knowledge base"],
-            "mode": "mix"
-        }
-        ```
-
         **Response Analysis:**
         - **Empty arrays**: Normal for certain modes (e.g., naive mode has no entities/relationships)
         - **Processing info**: Shows retrieval statistics and token usage
@@ -1139,21 +1078,34 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             as structured data analysis typically requires source attribution.
         """
         try:
+            # Reset token tracker at start of query if available
+            if token_tracker:
+                token_tracker.reset()
+
             param = request.to_query_params(False)  # No streaming for data endpoint
             response = await rag.aquery_data(request.query, param=param)
 
+            # Get token usage if available
+            token_usage = None
+            if token_tracker:
+                token_usage = token_tracker.get_usage()
+
             # aquery_data returns the new format with status, message, data, and metadata
             if isinstance(response, dict):
-                return QueryDataResponse(**response)
+                response_dict = dict(response)
+                response_dict["token_usage"] = token_usage
+                return QueryDataResponse(**response_dict)
             else:
                 # Handle unexpected response format
                 return QueryDataResponse(
                     status="failure",
-                    message="Invalid response type",
+                    message="Unexpected response format",
                     data={},
+                    metadata={},
+                    token_usage=None,
                 )
         except Exception as e:
-            logger.error(f"Error processing data query: {str(e)}", exc_info=True)
+            trace_exception(e)
             raise HTTPException(status_code=500, detail=str(e))
 
     return router
