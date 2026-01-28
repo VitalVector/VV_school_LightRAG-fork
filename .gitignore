@@ -73,3 +73,11 @@ test_*
 # Cline files
 memory-bank
 memory-bank/
+
+# Security - additional safeguards
+*.pem
+*.key
+*.crt
+secrets/
+credentials/
+.secrets/
