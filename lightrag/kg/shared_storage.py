@@ -1086,8 +1086,79 @@ def get_internal_lock(enable_logging: bool = False) -> UnifiedLock:
 
 # Workspace based storage_lock is implemented by get_storage_keyed_lock instead.
 # Workspace based pipeline_status_lock is implemented by get_storage_keyed_lock instead.
-# No need to implement graph_db_lock:
-#    data integrity is ensured by entity level keyed-lock and allowing only one process to hold pipeline at a time.
+
+
+def get_graph_db_lock(enable_logging: bool = False) -> UnifiedLock:
+    """Return unified graph database lock for ensuring atomic graph operations.
+
+    This lock is used by Neo4j and PostgreSQL storage implementations to ensure
+    atomic operations during finalize and drop operations.
+    """
+    global _async_locks, _is_multiprocess
+
+    # In single-process mode, create a simple async lock
+    if not _is_multiprocess:
+        # Use a module-level lock for single-process mode
+        if not hasattr(get_graph_db_lock, '_single_process_lock'):
+            get_graph_db_lock._single_process_lock = asyncio.Lock()
+        return UnifiedLock(
+            lock=get_graph_db_lock._single_process_lock,
+            is_async=True,
+            name="graph_db_lock",
+            enable_logging=enable_logging,
+            async_lock=None,
+        )
+
+    # In multi-process mode, use the async lock from _async_locks
+    async_lock = _async_locks.get("graph_db_lock") if _async_locks else None
+    if async_lock is None:
+        async_lock = asyncio.Lock()
+        if _async_locks is not None:
+            _async_locks["graph_db_lock"] = async_lock
+
+    return UnifiedLock(
+        lock=async_lock,
+        is_async=True,
+        name="graph_db_lock",
+        enable_logging=enable_logging,
+        async_lock=None,
+    )
+
+
+def get_storage_lock(enable_logging: bool = False) -> UnifiedLock:
+    """Return unified storage lock for ensuring atomic storage operations.
+
+    This is a compatibility function that wraps get_storage_keyed_lock for
+    code that expects a simple lock interface.
+    """
+    global _async_locks, _is_multiprocess
+
+    # In single-process mode, create a simple async lock
+    if not _is_multiprocess:
+        if not hasattr(get_storage_lock, '_single_process_lock'):
+            get_storage_lock._single_process_lock = asyncio.Lock()
+        return UnifiedLock(
+            lock=get_storage_lock._single_process_lock,
+            is_async=True,
+            name="storage_lock",
+            enable_logging=enable_logging,
+            async_lock=None,
+        )
+
+    # In multi-process mode, use the async lock
+    async_lock = _async_locks.get("storage_lock") if _async_locks else None
+    if async_lock is None:
+        async_lock = asyncio.Lock()
+        if _async_locks is not None:
+            _async_locks["storage_lock"] = async_lock
+
+    return UnifiedLock(
+        lock=async_lock,
+        is_async=True,
+        name="storage_lock",
+        enable_logging=enable_logging,
+        async_lock=None,
+    )
 
 
 def get_storage_keyed_lock(
