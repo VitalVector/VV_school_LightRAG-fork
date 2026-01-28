@@ -1,3 +1,9 @@
+> **VitalVector Fork** | This is a VitalVector fork of [HKUDS/LightRAG](https://github.com/HKUDS/LightRAG) with metadata filtering capabilities from [PR #2187](https://github.com/HKUDS/LightRAG/pull/2187).
+>
+> See [VitalVector Fork Documentation](#vitalvector-fork-documentation) below for fork-specific details.
+
+---
+
 <div align="center">
 
 <div style="margin: 20px 0;">
@@ -2117,3 +2123,120 @@ primaryClass={cs.IR}
     </div>
   </div>
 </div>
+
+---
+
+## VitalVector Fork Documentation
+
+This is a **VitalVector fork** of [HKUDS/LightRAG](https://github.com/HKUDS/LightRAG) that includes metadata filtering capabilities from [PR #2187](https://github.com/HKUDS/LightRAG/pull/2187).
+
+### Purpose
+
+This fork enables **database-level metadata filtering** for educational content retrieval in the VitalVector K-12 curriculum platform. The metadata filtering allows constraints such as:
+
+- **Grade level boundaries** - `grade_level <= student_grade`
+- **Language matching** - exact match filtering
+- **Board alignment** - CBSE/ICSE/State board filtering
+- **Subject filtering** - filter by curriculum subject
+
+### Metadata Filtering Usage
+
+```python
+from lightrag import LightRAG, QueryParam
+
+result = await rag.aquery(
+    "What is Pythagorean theorem?",
+    param=QueryParam(
+        mode="hybrid",
+        metadata_filter={
+            "language": "en",
+            "grade_level": {"$lte": 10},  # Grade 10 and below
+            "board": "CBSE"
+        }
+    )
+)
+# Database only returns chunks matching the filter
+```
+
+### PR #2187 Status
+
+| Field | Value |
+|-------|-------|
+| **Author** | [GGrassia](https://github.com/GGrassia) |
+| **Original PR** | [HKUDS/LightRAG#2187](https://github.com/HKUDS/LightRAG/pull/2187) |
+| **Status** | Not merged upstream (concerns about small corpus edge cases) |
+| **Production Use** | Author confirms >80% successful extraction in production |
+| **Our Use Case** | Large K-12 curriculum corpus mitigates the small corpus edge case |
+
+### Upstream Sync Procedure (Quarterly)
+
+This fork is maintained with quarterly syncs from upstream. Follow these steps:
+
+```bash
+# 1. Fetch upstream changes
+git fetch upstream
+
+# 2. Ensure you're on main branch
+git checkout main
+
+# 3. Merge upstream changes
+git merge upstream/main
+
+# 4. Resolve any conflicts (see Conflict Resolution below)
+
+# 5. Test the merge
+pip install -e .
+python -c "import lightrag; print('OK')"
+
+# 6. Push merged changes
+git push origin main
+
+# 7. Tag if needed (increment patch version)
+git tag -a v1.0.X-vv-metadata -m "Quarterly sync with upstream"
+git push origin v1.0.X-vv-metadata
+```
+
+### Conflict Resolution Approach
+
+When conflicts arise during upstream sync:
+
+1. **Metadata filtering files** (`postgres_impl.py`, `neo4j_impl.py`, `base.py`):
+   - Review changes carefully
+   - Preserve metadata filtering logic
+   - Integrate upstream improvements where compatible
+
+2. **Core LightRAG files** (`lightrag.py`, `operate.py`):
+   - Prefer upstream changes for core functionality
+   - Ensure metadata_filter parameter is preserved in QueryParam
+
+3. **Storage/Lock files** (`shared_storage.py`):
+   - Merge both upstream and our additions
+   - Ensure `get_graph_db_lock()` and `get_storage_lock()` functions remain
+
+4. **General approach**:
+   - Run tests after each conflict resolution
+   - Verify `import lightrag` works before committing
+   - Document any significant conflicts in commit messages
+
+### Related Links
+
+| Resource | URL |
+|----------|-----|
+| **Upstream Repository** | [HKUDS/LightRAG](https://github.com/HKUDS/LightRAG) |
+| **GGrassia's Fork** | [GGrassia/LightRAG](https://github.com/GGrassia/LightRAG) |
+| **Original PR** | [PR #2187](https://github.com/HKUDS/LightRAG/pull/2187) |
+| **LightRAG Documentation** | [Official Docs](https://lightrag.github.io/) |
+
+### Version History
+
+| Version | Date | Description |
+|---------|------|-------------|
+| `v1.0.0-vv-metadata` | 2026-01-28 | Initial fork with PR #2187 metadata filtering merged |
+
+### Fork Maintenance
+
+This fork is maintained by VitalVector for the K-12 educational content retrieval system. For issues specific to metadata filtering, please check this fork's issues. For general LightRAG issues, please refer to the upstream repository.
+
+---
+
+*This fork documentation is specific to the VitalVector fork. For complete LightRAG documentation, see the sections above or visit the [official repository](https://github.com/HKUDS/LightRAG).*
