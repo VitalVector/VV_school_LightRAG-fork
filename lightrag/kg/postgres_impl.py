@@ -1975,6 +1975,20 @@ class PGKVStorage(BaseKVStorage):
                 f"[{self.workspace}] Error while deleting records from {self.namespace}: {e}"
             )
 
+    async def is_empty(self) -> bool:
+        """Check if the storage is empty"""
+        try:
+            table_name = namespace_to_table_name(self.namespace)
+            if not table_name:
+                return True
+            result = await self.db.query(
+                f"SELECT 1 FROM {table_name} WHERE workspace = $1 LIMIT 1",
+                [self.workspace],
+            )
+            return len(result) == 0
+        except Exception:
+            return True
+
     async def drop(self) -> dict[str, str]:
         """Drop the storage"""
         async with get_storage_lock():
@@ -2997,6 +3011,17 @@ class PGDocStatusStorage(DocStatusStorage):
                     "updated_at": updated_at,  # Use the converted datetime object
                 },
             )
+
+    async def is_empty(self) -> bool:
+        """Check if the storage is empty"""
+        try:
+            result = await self.db.query(
+                "SELECT 1 FROM LIGHTRAG_DOC_STATUS WHERE workspace = $1 LIMIT 1",
+                [self.workspace],
+            )
+            return len(result) == 0
+        except Exception:
+            return True
 
     async def drop(self) -> dict[str, str]:
         """Drop the storage"""
