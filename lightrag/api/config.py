@@ -406,6 +406,9 @@ def parse_args() -> argparse.Namespace:
     )
     args.enable_token_tracking = get_env_value("ENABLE_TOKEN_TRACKING", False, bool)
 
+    # Token auto-renewal configuration
+    args.token_auto_renew = get_env_value("TOKEN_AUTO_RENEW", True, bool)
+
     ollama_server_infos.LIGHTRAG_NAME = args.simulated_model_name
     ollama_server_infos.LIGHTRAG_TAG = args.simulated_model_tag
 

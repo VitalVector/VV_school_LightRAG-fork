@@ -342,6 +342,7 @@ class EmbeddingFunc:
     embedding_dim: int
     func: callable
     max_token_size: int | None = None  # deprecated keep it for compatible only
+    model_name: str | None = None  # model identifier for embedding function
 
     async def __call__(self, *args, **kwargs) -> np.ndarray:
         return await self.func(*args, **kwargs)
