@@ -206,6 +206,10 @@ def create_app(args):
         try:
             # Initialize database connections
             await rag.initialize_storages()
+            # Set default workspace before initializing shared pipeline status
+            from lightrag.kg.shared_storage import set_default_workspace
+
+            set_default_workspace(args.workspace)
             await initialize_pipeline_status()
 
             # Data migration regardless of storage implementation
